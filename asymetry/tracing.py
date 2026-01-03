@@ -89,6 +89,7 @@ def observe(
     name: Optional[str] = None,
     kind: str = "internal",
     attributes: Optional[dict[str, Any]] = None,
+    span_type: Optional[str] = None,
     capture_args: bool = True,
     capture_result: bool = True,
 ) -> Callable:
@@ -99,6 +100,7 @@ def observe(
         name: Span name (defaults to function name)
         kind: Span kind (internal, client, server, producer, consumer)
         attributes: Additional attributes to attach to span
+        span_type: Type of span (e.g., "tool", "agent", "llm", "workflow")
         capture_args: Whether to capture function arguments
         capture_result: Whether to capture return value
 
@@ -119,13 +121,18 @@ def observe(
     def decorator(func: Callable) -> Callable:
         span_name = name or func.__qualname__
 
+        # Merge span_type into attributes
+        effective_attributes = attributes.copy() if attributes else {}
+        if span_type:
+            effective_attributes["span.type"] = span_type
+
         # Handle async functions
         if asyncio.iscoroutinefunction(func):
 
             @functools.wraps(func)
             async def async_wrapper(*args, **kwargs):
                 return await _trace_execution_async(
-                    func, span_name, kind, attributes, capture_args, capture_result, args, kwargs
+                    func, span_name, kind, effective_attributes, capture_args, capture_result, args, kwargs
                 )
 
             return async_wrapper
@@ -134,7 +141,7 @@ def observe(
         @functools.wraps(func)
         def sync_wrapper(*args, **kwargs):
             return _trace_execution_sync(
-                func, span_name, kind, attributes, capture_args, capture_result, args, kwargs
+                func, span_name, kind, effective_attributes, capture_args, capture_result, args, kwargs
             )
 
         return sync_wrapper
@@ -281,7 +288,12 @@ async def _trace_execution_async(
 
 
 @contextmanager
-def trace_context(name: str, attributes: Optional[dict[str, Any]] = None, kind: str = "internal"):
+def trace_context(
+    name: str,
+    attributes: Optional[dict[str, Any]] = None,
+    kind: str = "internal",
+    span_type: Optional[str] = None,
+):
     """
     Context manager for manual span creation.
 
@@ -311,6 +323,9 @@ def trace_context(name: str, attributes: Optional[dict[str, Any]] = None, kind: 
         if attributes:
             for key, value in attributes.items():
                 span.set_attribute(key, value)
+
+        if span_type:
+            span.set_attribute("span.type", span_type)
 
         try:
             yield span

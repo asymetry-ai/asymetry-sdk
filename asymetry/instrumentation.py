@@ -334,6 +334,101 @@ def _normalize_openai_tool_calls(tool_calls: Any) -> list[dict[str, Any]]:
     return normalized
 
 
+def _normalize_messages_for_json(messages: list[Any]) -> list[dict[str, Any]]:
+    """
+    Ensure all messages are serializable dicts.
+    Handles ChatCompletionMessage objects from OpenAI SDK.
+    """
+    if not messages:
+        return []
+
+    normalized = []
+    for m in messages:
+        if isinstance(m, dict):
+            normalized.append(m)
+            continue
+
+        # Try model_dump() (Pydantic/OpenAI models)
+        if hasattr(m, "model_dump"):
+            try:
+                # model_dump might return complex objects for tool_calls, so we need to process the result
+                data = m.model_dump()
+                
+                # If tool_calls are present in the dumped data, ensure they are normalized
+                if "tool_calls" in data and isinstance(data["tool_calls"], list):
+                     # Check if items in tool_calls are dicts; if not, normalize them
+                     if data["tool_calls"] and not isinstance(data["tool_calls"][0], dict):
+                         data["tool_calls"] = _normalize_openai_tool_calls(getattr(m, "tool_calls", []))
+                     # Also double-check for deeply nested objects just in case model_dump gave us mixed results
+                     # We can just run _normalize_openai_tool_calls on the list anyway if we have access to original objects
+                     # But if data["tool_calls"] are already dicts, we are fine.
+                     
+                     # Safety check: ensure everything in tool_calls IS a dict
+                     safe_tool_calls = []
+                     for tc in data["tool_calls"]:
+                         if isinstance(tc, dict):
+                             safe_tool_calls.append(tc)
+                         elif hasattr(tc, "model_dump"):
+                             safe_tool_calls.append(tc.model_dump())
+                         else:
+                             # Fallback to existing normalizer logic by pretending it's an object?
+                             # Or use the _normalize_openai_tool_calls if we can get the original list?
+                             # Best is to try to serialize THIS specific item
+                             try:
+                                 safe_tool_calls.append(
+                                     {
+                                         "id": getattr(tc, "id", None),
+                                         "type": getattr(tc, "type", None),
+                                         "function": {
+                                             "name": getattr(tc.function, "name", None),
+                                             "arguments": getattr(tc.function, "arguments", None)
+                                         } if hasattr(tc, "function") else None
+                                     }
+                                 )
+                             except Exception:
+                                 safe_tool_calls.append({"type": str(type(tc))})
+                     
+                     data["tool_calls"] = safe_tool_calls
+                
+                normalized.append(data)
+                continue
+            except Exception:
+                pass
+
+        # Try to extract common fields manually if model_dump failed or didn't exist
+        try:
+            msg_dict = {}
+            # Common fields
+            for field in ["role", "content", "name"]:
+                if hasattr(m, field):
+                    val = getattr(m, field)
+                    if val is not None:
+                        msg_dict[field] = val
+
+            # Complex fields
+            if hasattr(m, "tool_calls"):
+                tc = getattr(m, "tool_calls", None)
+                if tc:
+                    msg_dict["tool_calls"] = _normalize_openai_tool_calls(tc)
+            
+            if hasattr(m, "function_call"):
+                fc = getattr(m, "function_call", None)
+                if fc:
+                    msg_dict["function_call"] = _serialize_openai_function_call(fc)
+
+            if msg_dict:
+                normalized.append(msg_dict)
+                continue
+        except Exception:
+            pass
+
+        # Fallback
+        normalized.append({"_unserializable_type": str(type(m))})
+
+    return normalized
+
+
+
 # ---------------------------------------------------------------------------
 # OpenAI Instrumentation
 # ---------------------------------------------------------------------------
@@ -352,7 +447,7 @@ def _instrumented_chat_create(self, *args, **kwargs):
 
     # Extract parameters
     model = kwargs.get("model", "unknown")
-    messages = kwargs.get("messages", [])
+    messages = _normalize_messages_for_json(kwargs.get("messages", []))
     temperature = kwargs.get("temperature")
     max_tokens = kwargs.get("max_tokens")
 
@@ -535,7 +630,7 @@ def _instrumented_messages_create(self, *args, **kwargs):
 
     # Extract parameters
     model = kwargs.get("model", "unknown")
-    messages = kwargs.get("messages", [])
+    messages = _normalize_messages_for_json(kwargs.get("messages", []))
     system = kwargs.get("system")  # Anthropic has separate system parameter
     temperature = kwargs.get("temperature")
     max_tokens = kwargs.get("max_tokens")

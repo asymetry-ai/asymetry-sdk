@@ -68,10 +68,12 @@ class AsymetryAPIClient:
 
             # Debug logging
             logger.debug(
-                f"Sending batch: {len(requests)} requests, "
+                f"Sending!! batch: {len(requests)} requests, "
                 f"{len(tokens)} tokens, {len(errors)} errors, "
                 f"{len(traces) if traces else 0} traces"
             )
+
+            logger.debug(payload)
 
             response = await client.post(
                 self.config.api_url,
