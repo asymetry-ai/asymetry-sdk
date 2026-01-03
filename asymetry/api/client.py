@@ -5,6 +5,7 @@ import logging
 import httpx
 
 from ..config import get_config
+from ..version import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,7 @@ class AsymetryAPIClient:
                 headers={
                     "x-api-key": self.config.api_key,
                     "Content-Type": "application/json",
-                    "User-Agent": "asymetry-ai-sdk/0.1.0-alpha",
+                    "User-Agent": f"asymetry-ai-sdk/{__version__}",
                 },
             )
         return self._client

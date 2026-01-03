@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "asymetry"
-version = "0.1.1-alpha"
+version = "0.1.2-alpha"
 description = "LLM observability SDK for OpenAI and Anthropic"
 authors = ["Asymetry Team"]
 license = "MIT"

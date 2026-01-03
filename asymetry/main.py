@@ -13,6 +13,7 @@ from .instrumentation import (
 )
 from .exporter import start_exporter, stop_exporter, get_exporter
 from .tracing import init_tracing, shutdown_tracing, set_trace_queue
+from .version import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +99,7 @@ def init_observability(
     # Setup logging
     _setup_logging(log_level)
 
-    logger.info("🔍 Initializing Asymetry SDK v0.1.0-alpha")
+    logger.info(f"🔍 Initializing Asymetry SDK v{__version__}")
 
     # Load and validate config
     config = get_config()

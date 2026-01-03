@@ -1,6 +1,6 @@
 """Asymetry - LLM Observability SDK."""
 
-__version__ = "0.1.0-alpha"
+from .version import __version__
 
 # Core initialization
 from .main import init_observability, shutdown_observability
