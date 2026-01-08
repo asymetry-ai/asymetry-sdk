@@ -14,12 +14,15 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
 packages = [{include = "asymetry"}]
 
 [tool.poetry.dependencies]
-python = "^3.13"
+python = "^3.10"
 openai = "^1.0.0"
 anthropic = "0.72.0"
 httpx = "^0.27.0"
@@ -40,8 +43,8 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.black]
 line-length = 100
-target-version = ['py313']
+target-version = ['py310']
 
 [tool.ruff]
 line-length = 100
-target-version = "py313"
+target-version = "py310"
