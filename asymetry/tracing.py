@@ -23,6 +23,9 @@ from .exporter import get_exporter
 
 logger = logging.getLogger(__name__)
 
+# Valid span types
+VALID_SPAN_TYPES = frozenset({"tool", "agent", "llm", "workflow"})
+
 # Global tracer
 _tracer: Optional[trace.Tracer] = None
 _tracer_provider: Optional[TracerProvider] = None
@@ -100,7 +103,7 @@ def observe(
         name: Span name (defaults to function name)
         kind: Span kind (internal, client, server, producer, consumer)
         attributes: Additional attributes to attach to span
-        span_type: Type of span (e.g., "tool", "agent", "llm", "workflow")
+        span_type: Type of span. Must be one of: "tool", "agent", "llm", "workflow"
         capture_args: Whether to capture function arguments
         capture_result: Whether to capture return value
 
@@ -121,6 +124,12 @@ def observe(
     def decorator(func: Callable) -> Callable:
         span_name = name or func.__qualname__
 
+        # Validate span_type
+        if span_type is not None and span_type not in VALID_SPAN_TYPES:
+            raise ValueError(
+                f"Invalid span_type '{span_type}'. Must be one of: {', '.join(sorted(VALID_SPAN_TYPES))}"
+            )
+
         # Merge span_type into attributes
         effective_attributes = attributes.copy() if attributes else {}
         if span_type:
@@ -132,7 +141,14 @@ def observe(
             @functools.wraps(func)
             async def async_wrapper(*args, **kwargs):
                 return await _trace_execution_async(
-                    func, span_name, kind, effective_attributes, capture_args, capture_result, args, kwargs
+                    func,
+                    span_name,
+                    kind,
+                    effective_attributes,
+                    capture_args,
+                    capture_result,
+                    args,
+                    kwargs,
                 )
 
             return async_wrapper
@@ -141,7 +157,14 @@ def observe(
         @functools.wraps(func)
         def sync_wrapper(*args, **kwargs):
             return _trace_execution_sync(
-                func, span_name, kind, effective_attributes, capture_args, capture_result, args, kwargs
+                func,
+                span_name,
+                kind,
+                effective_attributes,
+                capture_args,
+                capture_result,
+                args,
+                kwargs,
             )
 
         return sync_wrapper
@@ -196,7 +219,7 @@ def _trace_execution_sync(
 
             # Capture result if requested
             if capture_result and result is not None:
-                span.set_attribute("function.result", json.dumps(result))
+                span.set_attribute("function.result", _safe_json_dumps(result))
 
             # Mark as successful
             span.set_status(Status(StatusCode.OK))
@@ -265,7 +288,7 @@ async def _trace_execution_async(
 
             # Capture result if requested
             if capture_result and result is not None:
-                span.set_attribute("function.result", json.dumps(result))
+                span.set_attribute("function.result", _safe_json_dumps(result))
 
             # Mark as successful
             span.set_status(Status(StatusCode.OK))
@@ -304,6 +327,12 @@ def trace_context(
             result = db.query(...)
         ```
     """
+    # Validate span_type
+    if span_type is not None and span_type not in VALID_SPAN_TYPES:
+        raise ValueError(
+            f"Invalid span_type '{span_type}'. Must be one of: {', '.join(sorted(VALID_SPAN_TYPES))}"
+        )
+
     if _tracer is None:
         logger.warning("Tracer not initialized, executing without tracing")
         yield None
@@ -376,6 +405,9 @@ def add_span_event(name: str, attributes: Optional[dict[str, Any]] = None) -> No
 class AsymetrySpanProcessor:
     """Custom span processor that exports to Asymetry queue."""
 
+    # Track error states for traces: trace_id -> has_error
+    _trace_error_states: dict[str, bool] = {}
+
     def on_start(self, span: trace.Span, parent_context) -> None:
         """Called when a span starts."""
         pass
@@ -386,6 +418,12 @@ class AsymetrySpanProcessor:
         # Just check if span exists and has required attributes
         if span is None:
             return
+
+        # Check for error status and record it for the trace
+        if getattr(span.status, "status_code", None) == StatusCode.ERROR:
+            # Use the hex trace_id format that we use elsewhere
+            trace_id = format(span.context.trace_id, "032x")
+            self._trace_error_states[trace_id] = True
 
         # Convert OTel span to our internal format
         trace_span = self._convert_span(span)
@@ -447,6 +485,18 @@ class AsymetrySpanProcessor:
                 status = "error"
                 error_message = span.status.description
 
+        # Check if this is a root span and if the trace had any errors
+        trace_id = format(span.context.trace_id, "032x")
+        is_root = not span.parent
+
+        if is_root:
+            # If any span in this trace had an error, mark root as error
+            if self._trace_error_states.pop(trace_id, False):
+                if status != "error":
+                    status = "error"
+                    if error_message is None:
+                        error_message = "Trace contains failed spans"
+
         # Extract events
         events = []
         if hasattr(span, "events"):
@@ -460,7 +510,7 @@ class AsymetrySpanProcessor:
                 )
 
         return TraceSpan(
-            trace_id=format(span.context.trace_id, "032x"),
+            trace_id=trace_id,
             span_id=format(span.context.span_id, "016x"),
             parent_span_id=format(span.parent.span_id, "016x") if span.parent else None,
             name=span.name,
@@ -475,6 +525,25 @@ class AsymetrySpanProcessor:
             input=input_data if input_data else None,
             output=output_data,
         )
+
+
+def _json_default(obj: Any) -> Any:
+    """Default JSON serializer for complex objects."""
+    if hasattr(obj, "model_dump") and callable(obj.model_dump):
+        return obj.model_dump()
+    if hasattr(obj, "dict") and callable(obj.dict):
+        return obj.dict()
+    if hasattr(obj, "to_dict") and callable(obj.to_dict):
+        return obj.to_dict()
+    return str(obj)
+
+
+def _safe_json_dumps(obj: Any) -> str:
+    """Safely dump to JSON string."""
+    try:
+        return json.dumps(obj, default=_json_default)
+    except Exception:
+        return str(obj)
 
 
 def _capture_arguments(span: trace.Span, func: Callable, args: tuple, kwargs: dict) -> None:
@@ -492,7 +561,7 @@ def _capture_arguments(span: trace.Span, func: Callable, args: tuple, kwargs: di
                 continue
 
             # Serialize and add as attribute
-            serialized = json.dumps(param_value)
+            serialized = _safe_json_dumps(param_value)
             span.set_attribute(f"function.args.{param_name}", serialized)
 
     except Exception as e:
