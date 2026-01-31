@@ -11,6 +11,7 @@ from .tracing import (
     trace_context,
     add_span_attribute,
     add_span_event,
+    VALID_SPAN_TYPES,
 )
 
 __all__ = [
@@ -22,5 +23,5 @@ __all__ = [
     "trace_context",
     "add_span_attribute",
     "add_span_event",
+    "VALID_SPAN_TYPES",
 ]
-

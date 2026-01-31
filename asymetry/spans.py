@@ -211,4 +211,3 @@ def llmrequest_from_otel_span(otel_span) -> "LLMRequest | None":
         return req
     except Exception:
         return None
-

@@ -149,12 +149,13 @@ Key guarantees:
 | Provider | API | Status | Notes |
 | --- | --- | --- | --- |
 | OpenAI | `chat.completions.create` (sync) | ✅ | Token usage extracted when OpenAI returns `usage`; otherwise estimated. |
-| OpenAI | Streaming (`stream=True`) | ⚠️ Partial | See `examples/test_streaming.py` for current behavior; chunk-level telemetry still WIP. |
+| OpenAI | Streaming (`stream=True`) | ✅ | Full telemetry: content accumulation, tool calls, token usage (real with `stream_options` or estimated), time-to-first-token. See `examples/example_streaming_openai.py`. |
 | Anthropic | `messages.create` (sync) | ✅ | Handles system prompt + tool use blocks; always captures usage. |
-| Anthropic | Streaming | ⚠️ Partial | Events enumerated in tests; telemetry enrichment planned. |
+| Anthropic | Streaming | ✅ | Full telemetry: event processing, content accumulation, tool uses, real token usage from message events. See `examples/example_streaming_anthropic.py`. |
 | Custom code | `@observe`, `trace_context` | ✅ | OpenTelemetry spans exported via same queue. |
 
-Roadmap items (tracked via GitHub issues): async client support, streaming deltas, additional providers, custom span ingestion, SDK-specific extras.
+Roadmap items (tracked via GitHub issues): async client support, additional providers, custom span ingestion, SDK-specific extras.
+
 
 ---
 

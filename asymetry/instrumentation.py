@@ -30,6 +30,559 @@ def set_span_queue(queue: Any) -> None:
     _span_queue = queue
 
 
+# ---------------------------------------------------------------------------
+# OpenAI Streaming Wrapper
+# ---------------------------------------------------------------------------
+
+
+class OpenAIStreamWrapper:
+    """
+    Wraps OpenAI streaming response to capture telemetry.
+
+    This wrapper intercepts the streaming iterator, accumulates content and tool calls,
+    extracts token usage from the final chunk (if available), and emits a span when
+    the stream completes.
+    """
+
+    def __init__(
+        self,
+        stream: Any,
+        span_context: "SpanContext",
+        otel_span: Any,
+        otel_ctx: Any,
+        otel_started_ns: int,
+        request: "LLMRequest",
+        messages: list[dict[str, Any]],
+        model: str,
+    ):
+        self._stream = stream
+        self._span_context = span_context
+        self._otel_span = otel_span
+        self._otel_ctx = otel_ctx
+        self._otel_started_ns = otel_started_ns
+        self._request = request
+        self._messages = messages
+        self._model = model
+
+        # Accumulated state
+        self._accumulated_content = ""
+        self._accumulated_tool_calls: list[dict[str, Any]] = []
+        self._tool_call_buffers: dict[int, dict[str, Any]] = {}  # Index -> tool call data
+        self._chunk_count = 0
+        self._finish_reason: str | None = None
+        self._usage: Any = None
+        self._first_chunk_time: float | None = None
+        self._finalized = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            chunk = next(self._stream)
+            self._process_chunk(chunk)
+            return chunk
+        except StopIteration:
+            self._finalize()
+            raise
+        except Exception as e:
+            self._finalize_with_error(e)
+            raise
+
+    def _process_chunk(self, chunk: Any) -> None:
+        """Process a single streaming chunk."""
+        self._chunk_count += 1
+
+        # Record time to first chunk
+        if self._first_chunk_time is None:
+            self._first_chunk_time = time.time()
+
+        # Extract content and tool calls from chunk
+        if hasattr(chunk, "choices") and chunk.choices:
+            for choice in chunk.choices:
+                delta = getattr(choice, "delta", None)
+                if not delta:
+                    continue
+
+                # Accumulate text content
+                content = getattr(delta, "content", None)
+                if content:
+                    self._accumulated_content += content
+
+                # Accumulate tool calls (streaming tool calls come in pieces)
+                tool_calls = getattr(delta, "tool_calls", None)
+                if tool_calls:
+                    for tc in tool_calls:
+                        idx = getattr(tc, "index", 0)
+                        if idx not in self._tool_call_buffers:
+                            self._tool_call_buffers[idx] = {
+                                "id": getattr(tc, "id", None),
+                                "type": getattr(tc, "type", None),
+                                "name": None,
+                                "arguments": "",
+                            }
+
+                        # Update with new data
+                        if getattr(tc, "id", None):
+                            self._tool_call_buffers[idx]["id"] = tc.id
+                        if getattr(tc, "type", None):
+                            self._tool_call_buffers[idx]["type"] = tc.type
+
+                        fn = getattr(tc, "function", None)
+                        if fn:
+                            if getattr(fn, "name", None):
+                                self._tool_call_buffers[idx]["name"] = fn.name
+                            if getattr(fn, "arguments", None):
+                                self._tool_call_buffers[idx]["arguments"] += fn.arguments
+
+                # Capture finish reason
+                finish_reason = getattr(choice, "finish_reason", None)
+                if finish_reason:
+                    self._finish_reason = finish_reason
+
+        # Capture usage from final chunk (if stream_options={"include_usage": True})
+        usage = getattr(chunk, "usage", None)
+        if usage:
+            self._usage = usage
+
+    def _finalize(self) -> None:
+        """Finalize the span after stream completes successfully."""
+        if self._finalized:
+            return
+        self._finalized = True
+
+        end_time = time.time()
+        self._span_context.finish(end_time)
+
+        # Populate request with accumulated data
+        self._request.messages = self._messages
+
+        # Convert tool call buffers to list
+        self._accumulated_tool_calls = list(self._tool_call_buffers.values())
+
+        # Build output
+        self._request.output = [
+            {
+                "role": "assistant",
+                "content": self._accumulated_content or None,
+                "tool_calls": (
+                    self._accumulated_tool_calls if self._accumulated_tool_calls else None
+                ),
+            }
+        ]
+        self._request.finish_reason = self._finish_reason
+
+        # Extract token usage
+        if self._usage:
+            # Real usage from OpenAI (stream_options={"include_usage": True})
+            self._span_context.tokens = TokenUsage(
+                request_id=self._request.request_id,
+                input_tokens=getattr(self._usage, "prompt_tokens", 0) or 0,
+                output_tokens=getattr(self._usage, "completion_tokens", 0) or 0,
+                total_tokens=getattr(self._usage, "total_tokens", 0) or 0,
+                estimated=False,
+                estimation_method=None,
+            )
+        else:
+            # Estimate tokens from accumulated content
+            from .token_utils import estimate_messages_tokens, estimate_tokens
+
+            input_tokens = estimate_messages_tokens(self._messages, self._model)
+            output_tokens, method = estimate_tokens(self._accumulated_content, self._model)
+
+            self._span_context.tokens = TokenUsage(
+                request_id=self._request.request_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=input_tokens + output_tokens,
+                estimated=True,
+                estimation_method=method,
+            )
+
+        # Update OTel span attributes
+        self._update_otel_span(ok=True)
+
+        # Mark as success and enqueue
+        self._request.status = "success"
+        _enqueue_span(self._span_context)
+
+    def _finalize_with_error(self, error: Exception) -> None:
+        """Finalize the span after stream fails with error."""
+        if self._finalized:
+            return
+        self._finalized = True
+
+        end_time = time.time()
+        self._span_context.finish(end_time)
+
+        self._request.status = "error"
+        self._request.messages = self._messages
+
+        # Create error record
+        error_type = type(error).__name__
+        error_code = getattr(error, "code", None)
+        error_message = str(error)
+        if hasattr(error, "message"):
+            error_message = error.message
+
+        self._span_context.error = LLMError(
+            request_id=self._request.request_id,
+            error_type=error_type,
+            error_code=error_code,
+            error_message=error_message,
+            stack_trace=traceback.format_exc()[:1000],
+        )
+
+        # Update OTel span
+        self._update_otel_span(ok=False)
+
+        # Enqueue span
+        _enqueue_span(self._span_context)
+
+    def _update_otel_span(self, ok: bool) -> None:
+        """Update OTel span with final attributes."""
+        try:
+            if self._otel_span is not None:
+                # Token counts
+                if self._span_context.tokens:
+                    self._otel_span.set_attribute(
+                        "llm.tokens.input", self._span_context.tokens.input_tokens
+                    )
+                    self._otel_span.set_attribute(
+                        "llm.tokens.output", self._span_context.tokens.output_tokens
+                    )
+                    self._otel_span.set_attribute(
+                        "llm.tokens.total", self._span_context.tokens.total_tokens
+                    )
+
+                # Streaming-specific attributes
+                self._otel_span.set_attribute("llm.stream.chunk_count", self._chunk_count)
+                if self._first_chunk_time:
+                    ttft_ms = (self._first_chunk_time - self._span_context.start_time) * 1000
+                    self._otel_span.set_attribute("llm.stream.time_to_first_token_ms", int(ttft_ms))
+
+                # Content and result
+                self._otel_span.set_attribute("function.args.messages", json.dumps(self._messages))
+                self._otel_span.set_attribute("function.result", json.dumps(self._request.output))
+
+                # Tool calls
+                if self._accumulated_tool_calls:
+                    self._otel_span.set_attribute(
+                        "llm.tools.count", len(self._accumulated_tool_calls)
+                    )
+                    self._otel_span.set_attribute(
+                        "llm.tools.names",
+                        [tc["name"] for tc in self._accumulated_tool_calls if tc.get("name")],
+                    )
+        except Exception:
+            pass
+
+        # Finalize OTel span
+        _finalize_llm_span(
+            self._otel_ctx,
+            self._otel_span,
+            self._otel_started_ns,
+            ok=ok,
+            finish_reason=self._finish_reason,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Anthropic Streaming Wrapper
+# ---------------------------------------------------------------------------
+
+
+class AnthropicStreamWrapper:
+    """
+    Wraps Anthropic streaming response to capture telemetry.
+
+    Anthropic streaming uses a context manager pattern with an event stream.
+    This wrapper intercepts events, accumulates content, extracts token usage
+    from message_start and message_delta events, and emits a span when the
+    stream completes.
+    """
+
+    def __init__(
+        self,
+        stream: Any,
+        span_context: "SpanContext",
+        otel_span: Any,
+        otel_ctx: Any,
+        otel_started_ns: int,
+        request: "LLMRequest",
+        messages: list[dict[str, Any]],
+        model: str,
+        system: str | None = None,
+    ):
+        self._stream = stream
+        self._span_context = span_context
+        self._otel_span = otel_span
+        self._otel_ctx = otel_ctx
+        self._otel_started_ns = otel_started_ns
+        self._request = request
+        self._messages = messages
+        self._model = model
+        self._system = system
+
+        # Accumulated state
+        self._accumulated_content = ""
+        self._accumulated_tool_uses: list[dict[str, Any]] = []
+        self._current_tool_use: dict[str, Any] | None = None
+        self._event_count = 0
+        self._stop_reason: str | None = None
+        self._input_tokens = 0
+        self._output_tokens = 0
+        self._first_content_time: float | None = None
+        self._finalized = False
+        self._event_stream: Any = None
+        self._error: Exception | None = None
+
+    def __enter__(self):
+        """Enter context manager and wrap the event stream."""
+        self._event_stream = self._stream.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Exit context manager and finalize telemetry."""
+        try:
+            if exc_type is not None:
+                self._error = exc_val
+                self._finalize_with_error(exc_val)
+            else:
+                self._finalize()
+        finally:
+            return self._stream.__exit__(exc_type, exc_val, exc_tb)
+
+    def __iter__(self):
+        """Iterate over events, processing each one."""
+        for event in self._event_stream:
+            self._process_event(event)
+            yield event
+
+    def _process_event(self, event: Any) -> None:
+        """Process a single streaming event."""
+        self._event_count += 1
+        event_type = getattr(event, "type", None)
+
+        if event_type == "message_start":
+            # Extract input tokens from message_start
+            message = getattr(event, "message", None)
+            if message:
+                usage = getattr(message, "usage", None)
+                if usage:
+                    self._input_tokens = getattr(usage, "input_tokens", 0) or 0
+
+        elif event_type == "content_block_start":
+            # Start of a new content block
+            content_block = getattr(event, "content_block", None)
+            if content_block:
+                block_type = getattr(content_block, "type", None)
+                if block_type == "tool_use":
+                    self._current_tool_use = {
+                        "type": "tool_use",
+                        "id": getattr(content_block, "id", None),
+                        "name": getattr(content_block, "name", None),
+                        "input": "",
+                    }
+
+        elif event_type == "content_block_delta":
+            # Content delta (text or tool input)
+            delta = getattr(event, "delta", None)
+            if delta:
+                delta_type = getattr(delta, "type", None)
+
+                if delta_type == "text_delta":
+                    # Record time to first content
+                    if self._first_content_time is None:
+                        self._first_content_time = time.time()
+
+                    text = getattr(delta, "text", "")
+                    self._accumulated_content += text
+
+                elif delta_type == "input_json_delta":
+                    # Tool input streaming
+                    if self._current_tool_use is not None:
+                        partial_json = getattr(delta, "partial_json", "")
+                        self._current_tool_use["input"] += partial_json
+
+        elif event_type == "content_block_stop":
+            # End of content block
+            if self._current_tool_use is not None:
+                # Try to parse accumulated JSON
+                try:
+                    import json as json_module
+
+                    self._current_tool_use["input"] = json_module.loads(
+                        self._current_tool_use["input"]
+                    )
+                except (json.JSONDecodeError, ValueError):
+                    pass  # Keep as string if parsing fails
+
+                self._accumulated_tool_uses.append(self._current_tool_use)
+                self._current_tool_use = None
+
+        elif event_type == "message_delta":
+            # Extract output tokens and stop reason
+            usage = getattr(event, "usage", None)
+            if usage:
+                self._output_tokens = getattr(usage, "output_tokens", 0) or 0
+
+            delta = getattr(event, "delta", None)
+            if delta:
+                self._stop_reason = getattr(delta, "stop_reason", None)
+
+        elif event_type == "message_stop":
+            # Stream complete
+            pass
+
+    def _finalize(self) -> None:
+        """Finalize the span after stream completes successfully."""
+        if self._finalized:
+            return
+        self._finalized = True
+
+        end_time = time.time()
+        self._span_context.finish(end_time)
+
+        # Populate request with accumulated data
+        full_messages = self._messages.copy()
+        if self._system:
+            full_messages.insert(0, {"role": "system", "content": self._system})
+        self._request.messages = full_messages
+
+        # Build output blocks
+        output_blocks = []
+        if self._accumulated_content:
+            output_blocks.append(
+                {
+                    "role": "assistant",
+                    "type": "text",
+                    "content": self._accumulated_content,
+                }
+            )
+        for tool_use in self._accumulated_tool_uses:
+            output_blocks.append(
+                {
+                    "role": "assistant",
+                    "type": "tool_use",
+                    "id": tool_use.get("id"),
+                    "name": tool_use.get("name"),
+                    "input": tool_use.get("input"),
+                }
+            )
+
+        self._request.output = output_blocks if output_blocks else None
+        self._request.finish_reason = self._stop_reason
+
+        # Token usage from events (Anthropic always provides this)
+        total_tokens = self._input_tokens + self._output_tokens
+        self._span_context.tokens = TokenUsage(
+            request_id=self._request.request_id,
+            input_tokens=self._input_tokens,
+            output_tokens=self._output_tokens,
+            total_tokens=total_tokens,
+            estimated=False,
+            estimation_method=None,
+        )
+
+        # Update OTel span
+        self._update_otel_span(ok=True)
+
+        # Mark as success and enqueue
+        self._request.status = "success"
+        _enqueue_span(self._span_context)
+
+    def _finalize_with_error(self, error: Exception) -> None:
+        """Finalize the span after stream fails with error."""
+        if self._finalized:
+            return
+        self._finalized = True
+
+        end_time = time.time()
+        self._span_context.finish(end_time)
+
+        self._request.status = "error"
+
+        # Populate messages
+        full_messages = self._messages.copy()
+        if self._system:
+            full_messages.insert(0, {"role": "system", "content": self._system})
+        self._request.messages = full_messages
+
+        # Create error record
+        error_type = type(error).__name__
+        error_code = getattr(error, "status_code", None)
+        if error_code:
+            error_code = str(error_code)
+        error_message = str(error)
+        if hasattr(error, "message"):
+            error_message = error.message
+
+        self._span_context.error = LLMError(
+            request_id=self._request.request_id,
+            error_type=error_type,
+            error_code=error_code,
+            error_message=error_message,
+            stack_trace=traceback.format_exc()[:1000],
+        )
+
+        # Update OTel span
+        self._update_otel_span(ok=False)
+
+        # Enqueue span
+        _enqueue_span(self._span_context)
+
+    def _update_otel_span(self, ok: bool) -> None:
+        """Update OTel span with final attributes."""
+        try:
+            if self._otel_span is not None:
+                # Token counts
+                if self._span_context.tokens:
+                    self._otel_span.set_attribute(
+                        "llm.tokens.input", self._span_context.tokens.input_tokens
+                    )
+                    self._otel_span.set_attribute(
+                        "llm.tokens.output", self._span_context.tokens.output_tokens
+                    )
+                    self._otel_span.set_attribute(
+                        "llm.tokens.total", self._span_context.tokens.total_tokens
+                    )
+
+                # Streaming-specific attributes
+                self._otel_span.set_attribute("llm.stream.event_count", self._event_count)
+                if self._first_content_time:
+                    ttft_ms = (self._first_content_time - self._span_context.start_time) * 1000
+                    self._otel_span.set_attribute("llm.stream.time_to_first_token_ms", int(ttft_ms))
+
+                # Content and result
+                all_messages = self._messages.copy()
+                if self._system:
+                    all_messages.insert(0, {"role": "system", "content": self._system})
+                self._otel_span.set_attribute("function.args.messages", json.dumps(all_messages))
+                self._otel_span.set_attribute("function.result", json.dumps(self._request.output))
+
+                # Tool uses
+                if self._accumulated_tool_uses:
+                    self._otel_span.set_attribute(
+                        "llm.tools.count", len(self._accumulated_tool_uses)
+                    )
+                    self._otel_span.set_attribute(
+                        "llm.tools.names",
+                        [tu.get("name") for tu in self._accumulated_tool_uses if tu.get("name")],
+                    )
+        except Exception:
+            pass
+
+        # Finalize OTel span
+        _finalize_llm_span(
+            self._otel_ctx,
+            self._otel_span,
+            self._otel_started_ns,
+            ok=ok,
+            finish_reason=self._stop_reason,
+        )
+
+
 def instrument_openai() -> None:
     """Monkey patch OpenAI client to capture telemetry."""
     global _original_chat_create, _instrumented_openai
@@ -353,43 +906,51 @@ def _normalize_messages_for_json(messages: list[Any]) -> list[dict[str, Any]]:
             try:
                 # model_dump might return complex objects for tool_calls, so we need to process the result
                 data = m.model_dump()
-                
+
                 # If tool_calls are present in the dumped data, ensure they are normalized
                 if "tool_calls" in data and isinstance(data["tool_calls"], list):
-                     # Check if items in tool_calls are dicts; if not, normalize them
-                     if data["tool_calls"] and not isinstance(data["tool_calls"][0], dict):
-                         data["tool_calls"] = _normalize_openai_tool_calls(getattr(m, "tool_calls", []))
-                     # Also double-check for deeply nested objects just in case model_dump gave us mixed results
-                     # We can just run _normalize_openai_tool_calls on the list anyway if we have access to original objects
-                     # But if data["tool_calls"] are already dicts, we are fine.
-                     
-                     # Safety check: ensure everything in tool_calls IS a dict
-                     safe_tool_calls = []
-                     for tc in data["tool_calls"]:
-                         if isinstance(tc, dict):
-                             safe_tool_calls.append(tc)
-                         elif hasattr(tc, "model_dump"):
-                             safe_tool_calls.append(tc.model_dump())
-                         else:
-                             # Fallback to existing normalizer logic by pretending it's an object?
-                             # Or use the _normalize_openai_tool_calls if we can get the original list?
-                             # Best is to try to serialize THIS specific item
-                             try:
-                                 safe_tool_calls.append(
-                                     {
-                                         "id": getattr(tc, "id", None),
-                                         "type": getattr(tc, "type", None),
-                                         "function": {
-                                             "name": getattr(tc.function, "name", None),
-                                             "arguments": getattr(tc.function, "arguments", None)
-                                         } if hasattr(tc, "function") else None
-                                     }
-                                 )
-                             except Exception:
-                                 safe_tool_calls.append({"type": str(type(tc))})
-                     
-                     data["tool_calls"] = safe_tool_calls
-                
+                    # Check if items in tool_calls are dicts; if not, normalize them
+                    if data["tool_calls"] and not isinstance(data["tool_calls"][0], dict):
+                        data["tool_calls"] = _normalize_openai_tool_calls(
+                            getattr(m, "tool_calls", [])
+                        )
+                    # Also double-check for deeply nested objects just in case model_dump gave us mixed results
+                    # We can just run _normalize_openai_tool_calls on the list anyway if we have access to original objects
+                    # But if data["tool_calls"] are already dicts, we are fine.
+
+                    # Safety check: ensure everything in tool_calls IS a dict
+                    safe_tool_calls = []
+                    for tc in data["tool_calls"]:
+                        if isinstance(tc, dict):
+                            safe_tool_calls.append(tc)
+                        elif hasattr(tc, "model_dump"):
+                            safe_tool_calls.append(tc.model_dump())
+                        else:
+                            # Fallback to existing normalizer logic by pretending it's an object?
+                            # Or use the _normalize_openai_tool_calls if we can get the original list?
+                            # Best is to try to serialize THIS specific item
+                            try:
+                                safe_tool_calls.append(
+                                    {
+                                        "id": getattr(tc, "id", None),
+                                        "type": getattr(tc, "type", None),
+                                        "function": (
+                                            {
+                                                "name": getattr(tc.function, "name", None),
+                                                "arguments": getattr(
+                                                    tc.function, "arguments", None
+                                                ),
+                                            }
+                                            if hasattr(tc, "function")
+                                            else None
+                                        ),
+                                    }
+                                )
+                            except Exception:
+                                safe_tool_calls.append({"type": str(type(tc))})
+
+                    data["tool_calls"] = safe_tool_calls
+
                 normalized.append(data)
                 continue
             except Exception:
@@ -410,7 +971,7 @@ def _normalize_messages_for_json(messages: list[Any]) -> list[dict[str, Any]]:
                 tc = getattr(m, "tool_calls", None)
                 if tc:
                     msg_dict["tool_calls"] = _normalize_openai_tool_calls(tc)
-            
+
             if hasattr(m, "function_call"):
                 fc = getattr(m, "function_call", None)
                 if fc:
@@ -426,7 +987,6 @@ def _normalize_messages_for_json(messages: list[Any]) -> list[dict[str, Any]]:
         normalized.append({"_unserializable_type": str(type(m))})
 
     return normalized
-
 
 
 # ---------------------------------------------------------------------------
@@ -477,16 +1037,35 @@ def _instrumented_chat_create(self, *args, **kwargs):
 
     span = SpanContext(request=request, start_time=start_time)
 
+    # Check if streaming is requested
+    is_streaming = kwargs.get("stream", False)
+
     try:
         # Call original method
         response = _original_chat_create(self, *args, **kwargs)
 
+        # Handle streaming response - wrap iterator to capture telemetry
+        if is_streaming:
+            logger.debug(f"OpenAI streaming request detected, wrapping response iterator")
+            return OpenAIStreamWrapper(
+                stream=response,
+                span_context=span,
+                otel_span=otel_span,
+                otel_ctx=otel_ctx,
+                otel_started_ns=otel_started_ns,
+                request=request,
+                messages=messages,
+                model=model,
+            )
+
+        # Non-streaming: process response normally
         # Capture request details
         request.messages = messages
 
         # Capture response
         finish_reason = None
         tool_calls_info = []
+
         if hasattr(response, "choices") and response.choices:
             normalized_output = []
             for choice in response.choices:
@@ -662,10 +1241,29 @@ def _instrumented_messages_create(self, *args, **kwargs):
 
     span = SpanContext(request=request, start_time=start_time)
 
+    # Check if streaming is requested
+    is_streaming = kwargs.get("stream", False)
+
     try:
         # Call original method
         response = _original_messages_create(self, *args, **kwargs)
 
+        # Handle streaming response - wrap context manager to capture telemetry
+        if is_streaming:
+            logger.debug(f"Anthropic streaming request detected, wrapping response stream")
+            return AnthropicStreamWrapper(
+                stream=response,
+                span_context=span,
+                otel_span=otel_span,
+                otel_ctx=otel_ctx,
+                otel_started_ns=otel_started_ns,
+                request=request,
+                messages=messages,
+                model=model,
+                system=system,
+            )
+
+        # Non-streaming: process response normally
         # Capture request details (include system prompt if present)
         request.messages = messages
         if system:
@@ -675,6 +1273,7 @@ def _instrumented_messages_create(self, *args, **kwargs):
         # Capture response - Anthropic returns content as list of blocks
         finish_reason = None
         tool_uses_info = []
+
         if hasattr(response, "content") and response.content:
             output_blocks = []
             for block in response.content:
