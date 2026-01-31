@@ -14,6 +14,14 @@ from .tracing import (
     VALID_SPAN_TYPES,
 )
 
+# OpenAI Agents SDK integration (optional)
+try:
+    from .openai_agents import AsymetryTracingProcessor, instrument_openai_agents
+
+    _HAS_OPENAI_AGENTS = True
+except ImportError:
+    _HAS_OPENAI_AGENTS = False
+
 __all__ = [
     # Initialization
     "init_observability",
@@ -25,3 +33,12 @@ __all__ = [
     "add_span_event",
     "VALID_SPAN_TYPES",
 ]
+
+# Add optional exports if available
+if _HAS_OPENAI_AGENTS:
+    __all__.extend(
+        [
+            "AsymetryTracingProcessor",
+            "instrument_openai_agents",
+        ]
+    )

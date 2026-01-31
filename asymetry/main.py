@@ -27,6 +27,7 @@ def init_observability(
     log_level: str = "INFO",
     service_name: str = "asymetry-ai-app",
     enable_tracing: bool = True,
+    enable_openai_agents: bool = True,
 ) -> None:
     """
     Initialize Asymetry observability.
@@ -147,6 +148,18 @@ def init_observability(
             instrumented_providers.append("Anthropic")
         except Exception as e:
             logger.debug(f"Could not instrument Anthropic: {e}")
+
+        # Try to instrument OpenAI Agents SDK
+        if enable_openai_agents:
+            try:
+                from .openai_agents import instrument_openai_agents
+
+                instrument_openai_agents()
+                instrumented_providers.append("OpenAI Agents")
+            except ImportError:
+                logger.debug("OpenAI Agents SDK not installed, skipping")
+            except Exception as e:
+                logger.debug(f"Could not instrument OpenAI Agents: {e}")
 
         # Log instrumentation status
         if instrumented_providers:

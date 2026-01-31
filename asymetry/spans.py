@@ -156,6 +156,52 @@ class TraceSpan:
         self.events.append(event)
 
 
+@dataclass
+class AgentSpan:
+    """
+    Agent SDK span data for OpenAI Agents and similar agentic frameworks.
+
+    This is a simplified span format that preserves the native structure
+    from agentic SDKs and gets sent to a dedicated ingestion endpoint.
+    """
+
+    # Identifiers
+    trace_id: str
+    span_id: str
+    parent_span_id: str | None = None
+
+    # Span classification
+    span_type: str = "custom"  # agent, tool, generation, handoff, guardrail, custom
+    name: str = ""
+
+    # Timing (Unix timestamp in seconds)
+    start_time: float = 0.0
+    end_time: float = 0.0
+
+    # Status
+    status: str = "success"
+    error_message: str | None = None
+
+    # Input/Output (JSON-serializable)
+    input: Any = None
+    output: Any = None
+
+    # Attributes (custom key-value pairs)
+    attributes: dict[str, Any] = field(default_factory=dict)
+
+    # LLM-specific fields (for generation spans)
+    model: str | None = None
+    provider: str | None = None
+    usage: dict[str, int] | None = None  # {input_tokens, output_tokens, total_tokens}
+
+    # Service info
+    service_name: str = "openai-agents"
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for API payload."""
+        return asdict(self)
+
+
 def llmrequest_from_otel_span(otel_span) -> "LLMRequest | None":
     """
     Build an LLMRequest projection from a finished OpenTelemetry span.

@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "asymetry"
-version = "0.1.5"
+version = "0.1.6"
 description = "LLM observability SDK for OpenAI and Anthropic"
 authors = ["Asymetry Team"]
 license = "MIT"
@@ -30,6 +30,12 @@ tiktoken = "^0.8.0"
 python-dotenv = "^1.0.0"
 opentelemetry-api = "1.20.0"
 opentelemetry-sdk = "1.20.0"
+
+# Optional: OpenAI Agents SDK integration
+openai-agents = {version = "^0.0.16", optional = true}
+
+[tool.poetry.extras]
+agents = ["openai-agents"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.0.0"

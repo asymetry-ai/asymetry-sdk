@@ -1,0 +1,29 @@
+## Summary Report
+
+### Directory Overview
+- Total number of files: 8
+- Total number of directories: 4
+
+### Markdown Files Summary
+
+#### README.md
+The `asymetry` SDK provides observability and tracing for OpenAI & Anthropic workloads, focusing on modern LLM operations. It interfaces with the official OpenAI and Anthropic SDKs to capture telemetry data such as latency, token usage, and errors, and exports this data to the Asymetry backend.
+
+**Key Features**
+- Automatic instrumentation of OpenAI and Anthropic APIs.
+- Rich span payloads for detailed telemetry analysis.
+- Custom tracing hooks for Python functions using OpenTelemetry.
+- A resilient exporter to maintain app responsiveness.
+- Compatibility with Python 3.13+ and Asymetry API key required.
+
+**Installation and Usage**
+- Installable via Poetry or Pip.
+- Configurable through environment variables.
+- Includes examples and troubleshooting tips.
+
+**Contributing**
+- Contributions are welcomed, focusing on areas like new providers and improved tracing support. Hosted on GitHub with a welcoming PR process.
+
+**License**
+- MIT License
+

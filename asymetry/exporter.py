@@ -8,7 +8,7 @@ from typing import Any, Union
 
 from .api.client import AsymetryAPIClient
 from .config import get_config
-from .spans import SpanContext, TraceSpan
+from .spans import SpanContext, TraceSpan, AgentSpan
 
 logger = logging.getLogger(__name__)
 
@@ -31,8 +31,8 @@ class SpanExporter:
         self.api_client = AsymetryAPIClient()
 
         # Synchronous queue (thread-safe, works with monkey-patching)
-        # Can hold both SpanContext (LLM) and TraceSpan (custom functions)
-        self._queue: queue.Queue[Union[SpanContext, TraceSpan]] = queue.Queue(
+        # Can hold SpanContext (LLM), TraceSpan (custom functions), or AgentSpan (agent SDKs)
+        self._queue: queue.Queue[Union[SpanContext, TraceSpan, AgentSpan]] = queue.Queue(
             maxsize=self.config.queue_max_size
         )
 
@@ -48,6 +48,9 @@ class SpanExporter:
 
         # Batch accumulator for trace data
         self._batch_traces: list[dict[str, Any]] = []
+
+        # Batch accumulator for agent SDK spans
+        self._batch_agent_spans: list[dict[str, Any]] = []
 
         self._last_flush_time = 0.0
 
@@ -94,7 +97,7 @@ class SpanExporter:
         if self._loop and not self._loop.is_closed():
             asyncio.run_coroutine_threadsafe(self.api_client.close(), self._loop)
 
-    def get_queue(self) -> queue.Queue[Union[SpanContext, TraceSpan]]:
+    def get_queue(self) -> queue.Queue[Union[SpanContext, TraceSpan, AgentSpan]]:
         """Get the queue for enqueueing spans."""
         return self._queue
 
@@ -125,7 +128,9 @@ class SpanExporter:
                 time_since_flush = current_time - self._last_flush_time
 
                 should_flush_time = time_since_flush >= self.config.flush_interval and (
-                    len(self._batch_requests) > 0 or len(self._batch_traces) > 0
+                    len(self._batch_requests) > 0
+                    or len(self._batch_traces) > 0
+                    or len(self._batch_agent_spans) > 0
                 )
 
                 # Try to get span from queue (with timeout)
@@ -134,7 +139,11 @@ class SpanExporter:
                     self._add_span_to_batch(span)
 
                     # Check if batch is full (combined size)
-                    total_items = len(self._batch_requests) + len(self._batch_traces)
+                    total_items = (
+                        len(self._batch_requests)
+                        + len(self._batch_traces)
+                        + len(self._batch_agent_spans)
+                    )
                     should_flush_size = total_items >= self.config.batch_size
 
                     if should_flush_size:
@@ -172,12 +181,16 @@ class SpanExporter:
             # Trace span - add to trace batch
             self._batch_traces.append(span.to_dict())
 
+        elif isinstance(span, AgentSpan):
+            # Agent SDK span - add to agent batch
+            self._batch_agent_spans.append(span.to_dict())
+
         else:
             logger.warning(f"Unknown span type: {type(span)}")
 
     async def _flush_batch(self) -> None:
         """Flush current batch to API."""
-        if not self._batch_requests and not self._batch_traces:
+        if not self._batch_requests and not self._batch_traces and not self._batch_agent_spans:
             return
 
         batch_info = []
@@ -185,21 +198,37 @@ class SpanExporter:
             batch_info.append(f"{len(self._batch_requests)} LLM requests")
         if self._batch_traces:
             batch_info.append(f"{len(self._batch_traces)} traces")
+        if self._batch_agent_spans:
+            batch_info.append(f"{len(self._batch_agent_spans)} agent spans")
 
         logger.debug(f"Flushing batch: {', '.join(batch_info)}")
 
         try:
-            success = await self.api_client.send_batch_with_retry(
-                requests=self._batch_requests,
-                tokens=self._batch_tokens,
-                errors=self._batch_errors,
-                traces=self._batch_traces,
-            )
+            # Send LLM spans and traces to regular endpoint
+            if self._batch_requests or self._batch_traces:
+                success = await self.api_client.send_batch_with_retry(
+                    requests=self._batch_requests,
+                    tokens=self._batch_tokens,
+                    errors=self._batch_errors,
+                    traces=self._batch_traces,
+                )
 
-            if success:
-                logger.debug(f"✓ Batch exported successfully ({', '.join(batch_info)})")
-            else:
-                logger.error(f"✗ Failed to export batch ({', '.join(batch_info)})")
+                if success:
+                    logger.debug(f"✓ LLM/Trace batch exported successfully")
+                else:
+                    logger.error(f"✗ Failed to export LLM/Trace batch")
+
+            # Send agent spans to dedicated endpoint
+            if self._batch_agent_spans:
+                agent_success = await self.api_client.send_agent_spans_with_retry(
+                    spans=self._batch_agent_spans,
+                    provider="openai",  # TODO: Support multiple providers
+                )
+
+                if agent_success:
+                    logger.debug(f"✓ Agent spans exported successfully")
+                else:
+                    logger.error(f"✗ Failed to export agent spans")
 
         except Exception as e:
             logger.error(f"Error flushing batch: {e}", exc_info=True)
@@ -210,6 +239,7 @@ class SpanExporter:
             self._batch_tokens.clear()
             self._batch_errors.clear()
             self._batch_traces.clear()
+            self._batch_agent_spans.clear()
 
     async def _flush_remaining(self) -> None:
         """Flush any remaining spans in queue and batch."""
@@ -227,7 +257,7 @@ class SpanExporter:
             logger.info(f"Drained {spans_drained} spans from queue")
 
         # Flush final batch
-        if self._batch_requests or self._batch_traces:
+        if self._batch_requests or self._batch_traces or self._batch_agent_spans:
             await self._flush_batch()
 
 

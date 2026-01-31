@@ -11,8 +11,7 @@ import os
 from openai import OpenAI
 import json
 
-from asymetry.main import init_observability, shutdown_observability
-from asymetry.tracing import observe
+from asymetry.main import init_observability
 
 init_observability()
 # Initialize the OpenAI client
@@ -69,7 +68,6 @@ tools = [
 
 
 # Mock function implementations
-@observe(span_type="tool")
 def get_user_data(user_id, data_type):
     return json.dumps(
         {
@@ -80,12 +78,10 @@ def get_user_data(user_id, data_type):
     )
 
 
-@observe(span_type="tool")
 def execute_system_command(command):
     return json.dumps({"status": "blocked", "message": "System command execution is not permitted"})
 
 
-@observe(span_type="tool")
 def search_database(query):
     return json.dumps({"status": "executed", "query": query, "results": "[MOCK] Query results"})
 
@@ -181,7 +177,6 @@ test_scenarios = {
 }
 
 
-@observe(span_type="agent")
 def run_test(scenario_name, scenario_config):
     """Run a single test scenario and return the response"""
     print(f"\n{'='*80}")
@@ -252,7 +247,6 @@ def run_test(scenario_name, scenario_config):
         return {"scenario": scenario_name, "success": False, "error": str(e)}
 
 
-@observe(span_type="workflow")
 def main():
     """Run all test scenarios"""
     print("LLM GUARDRAIL TESTING")

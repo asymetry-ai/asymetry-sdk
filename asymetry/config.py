@@ -27,6 +27,18 @@ class Config:
         # Request timeout
         self.request_timeout: float = float(os.getenv("ASYMETRY_REQUEST_TIMEOUT", "10.0"))
 
+    @property
+    def base_url(self) -> str:
+        """Extract base URL from api_url for building other endpoints."""
+        # api_url is like "https://api.asymetry.co/v1/ingest"
+        # base_url should be "https://api.asymetry.co"
+        url = self.api_url
+        # Find the third '/' (after https://)
+        parts = url.split("/")
+        if len(parts) >= 3:
+            return "/".join(parts[:3])
+        return url
+
     def validate(self) -> None:
         """Validate required configuration."""
         if self.enabled and not self.api_key:
@@ -69,4 +81,3 @@ def reset_config() -> None:
     """Reset config (useful for testing)."""
     global _config
     _config = None
-

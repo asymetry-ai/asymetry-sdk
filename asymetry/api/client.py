@@ -108,6 +108,91 @@ class AsymetryAPIClient:
             logger.error(f"Unexpected error sending batch: {e}")
             return False
 
+    async def send_agent_spans(
+        self,
+        spans: list[dict[str, any]],
+        provider: str = "openai",
+    ) -> bool:
+        """
+        Send agent SDK spans to dedicated endpoint.
+
+        Args:
+            spans: List of agent span records
+            provider: Agent SDK provider (e.g., "openai", "langchain")
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self.config.enabled:
+            logger.debug("Asymetry is disabled, skipping agent spans send")
+            return True
+
+        if not spans:
+            return True
+
+        payload = {"spans": spans}
+
+        try:
+            client = await self._get_client()
+
+            # Build endpoint URL
+            base_url = self.config.base_url.rstrip("/")
+            endpoint = f"{base_url}/v1/agents/{provider}/ingest"
+
+            logger.debug(f"Sending {len(spans)} agent spans to {endpoint}")
+
+            response = await client.post(endpoint, json=payload)
+
+            if response.status_code == 200:
+                logger.info(f"Successfully sent {len(spans)} agent spans")
+                return True
+            else:
+                logger.error(
+                    f"Agent spans API request failed with status {response.status_code}: "
+                    f"{response.text}"
+                )
+                return False
+
+        except httpx.TimeoutException:
+            logger.error(f"Agent spans API request timed out after {self.config.request_timeout}s")
+            return False
+        except httpx.RequestError as e:
+            logger.error(f"Agent spans API request error: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error sending agent spans: {e}")
+            return False
+
+    async def send_agent_spans_with_retry(
+        self,
+        spans: list[dict[str, any]],
+        provider: str = "openai",
+    ) -> bool:
+        """
+        Send agent spans with exponential backoff retry.
+
+        Returns:
+            True if successful, False after all retries exhausted
+        """
+        max_retries = self.config.max_retries
+
+        for attempt in range(max_retries):
+            success = await self.send_agent_spans(spans, provider)
+
+            if success:
+                return True
+
+            if attempt < max_retries - 1:
+                delay = 2**attempt
+                logger.warning(
+                    f"Agent spans send failed (attempt {attempt + 1}/{max_retries}), "
+                    f"retrying in {delay}s..."
+                )
+                await asyncio.sleep(delay)
+
+        logger.error(f"Agent spans send failed after {max_retries} attempts, dropping batch")
+        return False
+
     async def send_batch_with_retry(
         self,
         requests: list[dict[str, any]],
@@ -147,4 +232,3 @@ class AsymetryAPIClient:
             await self._client.aclose()
             self._client = None
             logger.debug("Asymetry API client closed")
-
