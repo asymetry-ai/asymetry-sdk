@@ -156,7 +156,7 @@ def extract_token_usage_anthropic(
 ) -> dict[str, Any]:
     """
     Extract token usage from Anthropic response.
-    
+
     Anthropic always provides actual token usage in the response.usage object,
     so we don't need to estimate tokens like we do for OpenAI.
 
@@ -187,17 +187,17 @@ def extract_token_usage_anthropic(
 
     # Estimate input tokens from messages
     input_tokens = 0
-    
+
     # Add system prompt tokens if present
     if system:
         tokens, _ = estimate_tokens(system, model)
         input_tokens += tokens
-    
+
     # Add message tokens
     for message in messages:
         # Message overhead
         input_tokens += 4
-        
+
         # Content tokens
         content = message.get("content", "")
         if isinstance(content, str):
@@ -237,4 +237,3 @@ def extract_token_usage_anthropic(
         "estimated": True,
         "estimation_method": "char_based",  # Claude uses different tokenizer than tiktoken
     }
-

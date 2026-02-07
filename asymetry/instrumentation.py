@@ -1111,11 +1111,11 @@ def _instrumented_chat_create(self, *args, **kwargs):
         token_data = extract_token_usage(response, messages, model)
         span.tokens = TokenUsage(
             request_id=request.request_id,
-            input_tokens=token_data["input_tokens"],
-            output_tokens=token_data["output_tokens"],
-            total_tokens=token_data["total_tokens"],
-            estimated=token_data["estimated"],
-            estimation_method=token_data["estimation_method"],
+            input_tokens=token_data.get("input_tokens", 0),
+            output_tokens=token_data.get("output_tokens", 0),
+            total_tokens=token_data.get("total_tokens", 0),
+            estimated=token_data.get("estimated", False),
+            estimation_method=token_data.get("estimation_method"),
         )
 
         # Write tokens + tool metadata to OTel attrs
